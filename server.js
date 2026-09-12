@@ -28,8 +28,9 @@ app.use(cors({ origin: process.env.ALLOWED_ORIGIN || '*' }));
 // Paste your Gemini API key between the quotes below if you're not using
 // a Render environment variable. If GEMINI_API_KEY is set on Render, that
 // takes priority automatically — you don't need to touch this line.
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || 'PASTE_YOUR_GEMINI_API_KEY_HERE';
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
+const GEMINI_IMAGE_MODEL = process.env.GEMINI_IMAGE_MODEL || 'gemini-3.1-flash-image';
 const DAILY_LIMIT = parseInt(process.env.DAILY_LIMIT || '10000', 10);
 
 // --- very simple in-memory quota store -------------------------------
@@ -81,7 +82,7 @@ app.post('/api/chat', async (req, res) => {
       return res.status(500).json({ error: 'Server missing GEMINI_API_KEY' });
     }
 
-    const { message, history, webSearch, images, userId } = req.body || {};
+    const { message, history, webSearch, images, userId, studentMode, modelStyle } = req.body || {};
     if (!message && (!images || images.length === 0)) {
       return res.status(400).json({ error: 'Empty message' });
     }
@@ -109,37 +110,128 @@ app.post('/api/chat', async (req, res) => {
     });
     contents.push({ role: 'user', parts });
 
-    const body = {
+    // Model "personality" tiers — same backend model, different system-prompt presets.
+    // Unlocked client-side via the XP system, same mechanism as avatar tiers.
+    const MODEL_STYLES = {
+      nova: 'Respond in a balanced, friendly, all-purpose style.',
+      atlas: 'Respond with precise, structured, analytical reasoning — favor clarity and rigor, lay out logic step by step, flag assumptions and edge cases.',
+      comet: 'Respond with a creative, expressive, conversational voice — vivid language, engaging framing, still accurate.',
+      quantum: 'Respond as a deep technical/coding specialist — favor complete, production-quality code, explain tradeoffs, anticipate bugs.'
+    };
+    const styleInstruction = MODEL_STYLES[modelStyle] || MODEL_STYLES.nova;
+    const studentInstruction = studentMode
+      ? ' STUDENT MODE IS ON: teach, don\'t just answer. Explain step by step like a patient tutor, check the learner\'s understanding, and for homework-like questions guide them to the answer rather than just handing it over.'
+      : '';
+
+    const baseBody = {
       contents,
       systemInstruction: {
-        parts: [{ text: 'You are Luminous AI, a premium, warm, precise assistant. Be clear, concise, and helpful. Format code in fenced code blocks.' }]
+        parts: [{ text: 'You are Luminous AI, a premium, warm, precise assistant. Be clear, concise, and helpful. Format code in fenced code blocks with a language tag. Use $...$ for inline math and $$...$$ for block math — never write raw LaTeX outside these delimiters. When asked for coding help, give complete, working, well-commented code and briefly explain the key decisions. When helping plan a trip, ask only for missing essentials (destination, dates, budget, interests) and then give a concrete day-by-day structure. ' + styleInstruction + studentInstruction }]
       }
     };
 
-    if (webSearch) {
-      body.tools = [{ google_search: {} }];
-    }
-
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
-    const geminiRes = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    });
 
-    const data = await geminiRes.json();
-
-    if (!geminiRes.ok) {
-      console.error('Gemini error:', JSON.stringify(data));
-      return res.status(502).json({ error: 'Gemini request failed', detail: data.error && data.error.message });
+    async function callGemini(withSearch) {
+      const body = { ...baseBody };
+      if (withSearch) body.tools = [{ google_search: {} }];
+      const r = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      const d = await r.json();
+      return { ok: r.ok, status: r.status, data: d };
     }
 
-    const candidate = data.candidates && data.candidates[0];
-    const reply = candidate && candidate.content && candidate.content.parts
+    let result = await callGemini(!!webSearch);
+    let searchFellBack = false;
+
+    // Grounding/search can fail for reasons unrelated to the rest of the request
+    // (e.g. billing not enabled on the key's project). Don't let that kill the whole reply —
+    // fall back to a normal answer instead of showing a hard error.
+    if (!result.ok && webSearch) {
+      console.error('Gemini web-search request failed, retrying without search:', JSON.stringify(result.data));
+      searchFellBack = true;
+      result = await callGemini(false);
+    }
+
+    if (!result.ok) {
+      console.error('Gemini error:', JSON.stringify(result.data));
+      return res.status(502).json({
+        error: 'Gemini request failed',
+        detail: result.data && result.data.error && result.data.error.message
+      });
+    }
+
+    const candidate = result.data.candidates && result.data.candidates[0];
+    let reply = candidate && candidate.content && candidate.content.parts
       ? candidate.content.parts.map(p => p.text || '').join('\n').trim()
       : "I couldn't generate a response for that — try rephrasing.";
 
-    res.json({ reply, model: GEMINI_MODEL });
+    if (searchFellBack) {
+      reply = "*(Web search is temporarily unavailable, so this answer isn't grounded in live results.)*\n\n" + reply;
+    }
+
+    // Pull the sites actually used for grounding, if any, so the client can show them.
+    let sources = [];
+    const gm = candidate && candidate.groundingMetadata;
+    if (gm && Array.isArray(gm.groundingChunks)) {
+      sources = gm.groundingChunks
+        .map(c => c.web && { title: c.web.title || c.web.uri, uri: c.web.uri })
+        .filter(Boolean);
+      // de-dupe by uri
+      const seen = new Set();
+      sources = sources.filter(s => !seen.has(s.uri) && seen.add(s.uri));
+    }
+
+    res.json({ reply, model: GEMINI_MODEL, searchFellBack, sources });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * Image generation endpoint — used for the general "generate an image" feature
+ * and for the anime-avatar unlocks in the XP/challenges system.
+ * Uses Gemini's native image-output model ("Nano Banana"). Costs 1 request
+ * from the same daily quota as chat, to keep the quota logic in one place.
+ */
+app.post('/api/generate-image', async (req, res) => {
+  try {
+    if (!GEMINI_API_KEY) {
+      return res.status(500).json({ error: 'Server missing GEMINI_API_KEY' });
+    }
+    const { prompt, userId } = req.body || {};
+    if (!prompt) return res.status(400).json({ error: 'Missing prompt' });
+
+    if (!checkAndConsumeQuota(userId)) {
+      return res.status(429).json({ error: 'Daily limit reached', reply: "You've used all your requests for today — watch an ad in the app to unlock 10 more." });
+    }
+
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_IMAGE_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        generationConfig: { responseModalities: ['TEXT', 'IMAGE'] }
+      })
+    });
+    const data = await r.json();
+    if (!r.ok) {
+      console.error('Image gen error:', JSON.stringify(data));
+      return res.status(502).json({ error: 'Image generation failed', detail: data.error && data.error.message });
+    }
+    const parts = (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [];
+    const imgPart = parts.find(p => p.inlineData || p.inline_data);
+    const inline = imgPart && (imgPart.inlineData || imgPart.inline_data);
+    if (!inline) {
+      return res.status(502).json({ error: 'No image returned', detail: 'Model responded without image data — try a different prompt.' });
+    }
+    const mime = inline.mimeType || inline.mime_type || 'image/png';
+    res.json({ image: `data:${mime};base64,${inline.data}` });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Internal server error' });
