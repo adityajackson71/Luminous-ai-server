@@ -187,17 +187,20 @@ app.post('/api/chat', async (req, res) => {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      buffer += decoder.decode(value, { stream: true });
+      // Normalize line endings — Gemini's SSE stream may use \r\n, and if we
+      // only split on \n\n, CRLF-style events never match and the whole
+      // response silently buffers with nothing parsed until the stream ends.
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
       let idx;
       while ((idx = buffer.indexOf('\n\n')) !== -1) {
         const rawEvent = buffer.slice(0, idx);
         buffer = buffer.slice(idx + 2);
-        const dataLine = rawEvent.split('\n').find(l => l.startsWith('data:'));
-        if (!dataLine) continue;
-        const jsonStr = dataLine.slice(5).trim();
+        const dataLines = rawEvent.split('\n').filter(l => l.startsWith('data:'));
+        if (!dataLines.length) continue;
+        const jsonStr = dataLines.map(l => l.slice(5).trim()).join('');
         if (!jsonStr) continue;
         let evt;
-        try { evt = JSON.parse(jsonStr); } catch (e) { continue; }
+        try { evt = JSON.parse(jsonStr); } catch (e) { console.error('SSE parse failed for chunk:', jsonStr.slice(0,200)); continue; }
         const cand = evt.candidates && evt.candidates[0];
         const textPiece = cand && cand.content && cand.content.parts
           ? cand.content.parts.map(p => p.text || '').join('')
@@ -213,6 +216,19 @@ app.post('/api/chat', async (req, res) => {
       }
     }
 
+    if (!gotAnyText) {
+      // Handle a trailing event that never got a final \n\n terminator.
+      const dataLines = buffer.split('\n').filter(l => l.startsWith('data:'));
+      if (dataLines.length) {
+        const jsonStr = dataLines.map(l => l.slice(5).trim()).join('');
+        try {
+          const evt = JSON.parse(jsonStr);
+          const cand = evt.candidates && evt.candidates[0];
+          const textPiece = cand && cand.content && cand.content.parts ? cand.content.parts.map(p => p.text || '').join('') : '';
+          if (textPiece) { gotAnyText = true; res.write(`data: ${JSON.stringify({ delta: textPiece })}\n\n`); }
+        } catch (e) {}
+      }
+    }
     if (!gotAnyText) {
       res.write(`data: ${JSON.stringify({ delta: "I couldn't generate a response for that — try rephrasing." })}\n\n`);
     }
