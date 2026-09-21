@@ -33,6 +33,10 @@ const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
 const GEMINI_IMAGE_MODEL = process.env.GEMINI_IMAGE_MODEL || 'gemini-3.1-flash-image';
 const DAILY_LIMIT = parseInt(process.env.DAILY_LIMIT || '500', 10);
 
+function friendlyQuotaMessage(rawDetail) {
+  return "Google's Gemini API has temporarily rate-limited this key (its own limit, separate from the app's daily counter). Free-tier keys allow a limited number of requests per minute and per day — this usually clears within a minute or so, or resets at the next daily cycle. If it keeps happening, enabling billing on the Google Cloud project tied to this API key raises those limits a lot. Details from Google: " + (rawDetail || 'quota exceeded');
+}
+
 // --- very simple in-memory quota store -------------------------------
 // NOTE: resets on server restart / redeploy, and doesn't sync across
 // devices. The client also tracks its own quota in localStorage.
@@ -149,21 +153,32 @@ app.post('/api/chat', async (req, res) => {
     let searchFellBack = false;
 
     // Grounding/search can fail for reasons unrelated to the rest of the request
-    // (e.g. billing not enabled on the key's project). Don't let that kill the whole reply —
-    // fall back to a normal streamed answer instead of showing a hard error.
+    // (e.g. billing not enabled for grounding specifically). Fall back to a normal
+    // streamed answer instead of showing a hard error — but ONLY when the failure
+    // looks search-specific. A genuine quota/rate-limit error will fail identically
+    // on retry, so retrying just doubles the wait and burns a second request for nothing.
     if (!upstream.ok && webSearch) {
       const errBody = await upstream.text().catch(() => '');
-      console.error('Gemini web-search stream failed, retrying without search:', errBody);
-      searchFellBack = true;
-      upstream = await openStream(false);
+      const isQuotaOrAuth = /RESOURCE_EXHAUSTED|exceeded your current quota|PERMISSION_DENIED|API key/i.test(errBody);
+      if (!isQuotaOrAuth) {
+        console.error('Gemini web-search stream failed, retrying without search:', errBody);
+        searchFellBack = true;
+        upstream = await openStream(false);
+      } else {
+        console.error('Gemini stream failed with a quota/auth error — not retrying:', errBody);
+        let detail;
+        try { detail = JSON.parse(errBody).error?.message; } catch (e) { detail = errBody; }
+        return res.status(429).json({ error: 'Gemini quota exceeded', detail: friendlyQuotaMessage(detail) });
+      }
     }
 
     if (!upstream.ok) {
       const errBody = await upstream.text().catch(() => '');
       console.error('Gemini stream error:', errBody);
       let detail;
-      try { detail = JSON.parse(errBody).error?.message; } catch (e) {}
-      return res.status(502).json({ error: 'Gemini request failed', detail });
+      try { detail = JSON.parse(errBody).error?.message; } catch (e) { detail = errBody; }
+      const isQuota = /RESOURCE_EXHAUSTED|exceeded your current quota/i.test(errBody);
+      return res.status(isQuota ? 429 : 502).json({ error: 'Gemini request failed', detail: isQuota ? friendlyQuotaMessage(detail) : detail });
     }
 
     // From here on we're committed to an SSE response — stream text deltas as they arrive.
@@ -267,7 +282,11 @@ app.post('/api/summarize', async (req, res) => {
       })
     });
     const data = await r.json();
-    if (!r.ok) return res.status(502).json({ error: 'Summarize failed', detail: data.error && data.error.message });
+    if (!r.ok) {
+      const msg = data.error && data.error.message;
+      const isQuota = (data.error && data.error.status === 'RESOURCE_EXHAUSTED') || /exceeded your current quota/i.test(msg || '');
+      return res.status(isQuota ? 429 : 502).json({ error: 'Summarize failed', detail: isQuota ? friendlyQuotaMessage(msg) : msg });
+    }
     const candidate = data.candidates && data.candidates[0];
     const summary = candidate && candidate.content && candidate.content.parts
       ? candidate.content.parts.map(p => p.text || '').join(' ').trim()
