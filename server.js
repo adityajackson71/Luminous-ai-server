@@ -31,7 +31,7 @@ app.use(cors({ origin: process.env.ALLOWED_ORIGIN || '*' }));
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || 'PASTE_YOUR_GEMINI_API_KEY_HERE';
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
 const GEMINI_IMAGE_MODEL = process.env.GEMINI_IMAGE_MODEL || 'gemini-3.1-flash-image';
-const DAILY_LIMIT = parseInt(process.env.DAILY_LIMIT || '10000', 10);
+const DAILY_LIMIT = parseInt(process.env.DAILY_LIMIT || '500', 10);
 
 // --- very simple in-memory quota store -------------------------------
 // NOTE: resets on server restart / redeploy, and doesn't sync across
@@ -116,76 +116,147 @@ app.post('/api/chat', async (req, res) => {
       nova: 'Respond in a balanced, friendly, all-purpose style.',
       atlas: 'Respond with precise, structured, analytical reasoning — favor clarity and rigor, lay out logic step by step, flag assumptions and edge cases.',
       comet: 'Respond with a creative, expressive, conversational voice — vivid language, engaging framing, still accurate.',
-      quantum: 'Respond as a deep technical/coding specialist — favor complete, production-quality code, explain tradeoffs, anticipate bugs.'
+      quantum: 'Respond as a deep technical/coding specialist — favor complete, production-quality, idiomatic code, explain tradeoffs, anticipate bugs and edge cases, and never truncate or abbreviate code with "...rest of code..." placeholders.'
     };
     const styleInstruction = MODEL_STYLES[modelStyle] || MODEL_STYLES.nova;
     const studentInstruction = studentMode
       ? ' STUDENT MODE IS ON: teach, don\'t just answer. Explain step by step like a patient tutor, check the learner\'s understanding, and for homework-like questions guide them to the answer rather than just handing it over.'
       : '';
 
+    const CODING_INSTRUCTION = ' When the request involves code: think through the requirements before writing, then produce complete, runnable, well-structured code with meaningful names and brief inline comments on non-obvious parts. Handle edge cases and errors explicitly rather than ignoring them. Never truncate code or replace sections with placeholders like "// rest stays the same" — always output the full file or function. After the code, briefly explain key design decisions and mention any real limitations or follow-ups. Prefer modern, idiomatic syntax for the language in question.';
+
     const baseBody = {
       contents,
       systemInstruction: {
-        parts: [{ text: 'You are Luminous AI, a premium, warm, precise assistant. Be clear, concise, and helpful. Format code in fenced code blocks with a language tag. Use $...$ for inline math and $$...$$ for block math — never write raw LaTeX outside these delimiters. When asked for coding help, give complete, working, well-commented code and briefly explain the key decisions. When helping plan a trip, ask only for missing essentials (destination, dates, budget, interests) and then give a concrete day-by-day structure. ' + styleInstruction + studentInstruction }]
-      }
+        parts: [{ text: 'You are Luminous AI, a premium, warm, precise assistant. Be clear, concise, and helpful. Format code in fenced code blocks with a language tag. Use $...$ for inline math and $$...$$ for block math — never write raw LaTeX outside these delimiters. When helping plan a trip, ask only for missing essentials (destination, dates, budget, interests) and then give a concrete day-by-day structure.' + CODING_INSTRUCTION + ' ' + styleInstruction + studentInstruction }]
+      },
+      generationConfig: { maxOutputTokens: 8192, temperature: 0.7 }
     };
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+    const streamUrl = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:streamGenerateContent?alt=sse&key=${GEMINI_API_KEY}`;
 
-    async function callGemini(withSearch) {
+    async function openStream(withSearch) {
       const body = { ...baseBody };
       if (withSearch) body.tools = [{ google_search: {} }];
-      const r = await fetch(url, {
+      return fetch(streamUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body)
       });
-      const d = await r.json();
-      return { ok: r.ok, status: r.status, data: d };
     }
 
-    let result = await callGemini(!!webSearch);
+    let upstream = await openStream(!!webSearch);
     let searchFellBack = false;
 
     // Grounding/search can fail for reasons unrelated to the rest of the request
     // (e.g. billing not enabled on the key's project). Don't let that kill the whole reply —
-    // fall back to a normal answer instead of showing a hard error.
-    if (!result.ok && webSearch) {
-      console.error('Gemini web-search request failed, retrying without search:', JSON.stringify(result.data));
+    // fall back to a normal streamed answer instead of showing a hard error.
+    if (!upstream.ok && webSearch) {
+      const errBody = await upstream.text().catch(() => '');
+      console.error('Gemini web-search stream failed, retrying without search:', errBody);
       searchFellBack = true;
-      result = await callGemini(false);
+      upstream = await openStream(false);
     }
 
-    if (!result.ok) {
-      console.error('Gemini error:', JSON.stringify(result.data));
-      return res.status(502).json({
-        error: 'Gemini request failed',
-        detail: result.data && result.data.error && result.data.error.message
-      });
+    if (!upstream.ok) {
+      const errBody = await upstream.text().catch(() => '');
+      console.error('Gemini stream error:', errBody);
+      let detail;
+      try { detail = JSON.parse(errBody).error?.message; } catch (e) {}
+      return res.status(502).json({ error: 'Gemini request failed', detail });
     }
 
-    const candidate = result.data.candidates && result.data.candidates[0];
-    let reply = candidate && candidate.content && candidate.content.parts
-      ? candidate.content.parts.map(p => p.text || '').join('\n').trim()
-      : "I couldn't generate a response for that — try rephrasing.";
+    // From here on we're committed to an SSE response — stream text deltas as they arrive.
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive'
+    });
+    res.flushHeaders && res.flushHeaders();
 
     if (searchFellBack) {
-      reply = "*(Web search is temporarily unavailable, so this answer isn't grounded in live results.)*\n\n" + reply;
+      res.write(`data: ${JSON.stringify({ note: "Web search is temporarily unavailable, so this answer isn't grounded in live results." })}\n\n`);
     }
 
-    // Pull the sites actually used for grounding, if any, so the client can show them.
+    const reader = upstream.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
     let sources = [];
-    const gm = candidate && candidate.groundingMetadata;
-    if (gm && Array.isArray(gm.groundingChunks)) {
-      sources = gm.groundingChunks
-        .map(c => c.web && { title: c.web.title || c.web.uri, uri: c.web.uri })
-        .filter(Boolean);
-      // de-dupe by uri
+    let gotAnyText = false;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buffer.indexOf('\n\n')) !== -1) {
+        const rawEvent = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        const dataLine = rawEvent.split('\n').find(l => l.startsWith('data:'));
+        if (!dataLine) continue;
+        const jsonStr = dataLine.slice(5).trim();
+        if (!jsonStr) continue;
+        let evt;
+        try { evt = JSON.parse(jsonStr); } catch (e) { continue; }
+        const cand = evt.candidates && evt.candidates[0];
+        const textPiece = cand && cand.content && cand.content.parts
+          ? cand.content.parts.map(p => p.text || '').join('')
+          : '';
+        if (textPiece) {
+          gotAnyText = true;
+          res.write(`data: ${JSON.stringify({ delta: textPiece })}\n\n`);
+        }
+        const gm = cand && cand.groundingMetadata;
+        if (gm && Array.isArray(gm.groundingChunks)) {
+          sources = gm.groundingChunks.map(c => c.web && { title: c.web.title || c.web.uri, uri: c.web.uri }).filter(Boolean);
+        }
+      }
+    }
+
+    if (!gotAnyText) {
+      res.write(`data: ${JSON.stringify({ delta: "I couldn't generate a response for that — try rephrasing." })}\n\n`);
+    }
+    if (sources.length) {
       const seen = new Set();
       sources = sources.filter(s => !seen.has(s.uri) && seen.add(s.uri));
+      res.write(`data: ${JSON.stringify({ sources })}\n\n`);
     }
+    res.write('data: [DONE]\n\n');
+    res.end();
+  } catch (err) {
+    console.error(err);
+    try { res.write(`data: ${JSON.stringify({ error: 'Internal server error' })}\n\n`); res.end(); } catch (e) {}
+  }
+});
 
-    res.json({ reply, model: GEMINI_MODEL, searchFellBack, sources });
+/**
+ * Summarize an existing AI reply in 2-3 sentences — used by the "Summarize"
+ * action under long replies in the app. Cheap, non-streamed, no history needed.
+ */
+app.post('/api/summarize', async (req, res) => {
+  try {
+    if (!GEMINI_API_KEY) return res.status(500).json({ error: 'Server missing GEMINI_API_KEY' });
+    const { text, userId } = req.body || {};
+    if (!text) return res.status(400).json({ error: 'Missing text' });
+    if (!checkAndConsumeQuota(userId)) {
+      return res.status(429).json({ error: 'Daily limit reached' });
+    }
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ role: 'user', parts: [{ text: 'Summarize the following in 2-3 short, plain sentences. No preamble, no markdown headers, just the summary:\n\n' + text }] }],
+        generationConfig: { maxOutputTokens: 300, temperature: 0.3 }
+      })
+    });
+    const data = await r.json();
+    if (!r.ok) return res.status(502).json({ error: 'Summarize failed', detail: data.error && data.error.message });
+    const candidate = data.candidates && data.candidates[0];
+    const summary = candidate && candidate.content && candidate.content.parts
+      ? candidate.content.parts.map(p => p.text || '').join(' ').trim()
+      : null;
+    res.json({ summary: summary || "Couldn't summarize that." });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Internal server error' });
@@ -222,7 +293,16 @@ app.post('/api/generate-image', async (req, res) => {
     const data = await r.json();
     if (!r.ok) {
       console.error('Image gen error:', JSON.stringify(data));
-      return res.status(502).json({ error: 'Image generation failed', detail: data.error && data.error.message });
+      const status = data.error && data.error.status;
+      const msg = (data.error && data.error.message) || '';
+      const isQuota = status === 'RESOURCE_EXHAUSTED' || /quota|exceeded/i.test(msg);
+      if (isQuota) {
+        return res.status(429).json({
+          error: 'Image generation quota exceeded',
+          detail: "Google's image-generation model gives 0 free requests per day on API keys without billing enabled — this isn't a bug in the app. Enable billing on the Google Cloud project tied to your Gemini API key (Google AI Studio → your project → Billing) to unlock image generation. Text chat is unaffected and keeps working on the free tier."
+        });
+      }
+      return res.status(502).json({ error: 'Image generation failed', detail: msg || 'Unknown error from Gemini.' });
     }
     const parts = (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [];
     const imgPart = parts.find(p => p.inlineData || p.inline_data);
