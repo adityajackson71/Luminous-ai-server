@@ -37,6 +37,22 @@ function friendlyQuotaMessage(rawDetail) {
   return "Google's Gemini API has temporarily rate-limited this key (its own limit, separate from the app's daily counter). Free-tier keys allow a limited number of requests per minute and per day — this usually clears within a minute or so, or resets at the next daily cycle. If it keeps happening, enabling billing on the Google Cloud project tied to this API key raises those limits a lot. Details from Google: " + (rawDetail || 'quota exceeded');
 }
 
+// Gemini's 429 responses include a structured RetryInfo detail with the exact
+// cooldown (e.g. "58.28s") — pull that out so the client can show a real
+// countdown and auto-retry instead of dumping Google's whole error paragraph.
+function extractRetryDelaySeconds(errBody) {
+  try {
+    const parsed = JSON.parse(errBody);
+    const details = (parsed.error && parsed.error.details) || [];
+    const retryInfo = details.find(d => (d['@type'] || '').includes('RetryInfo'));
+    if (retryInfo && retryInfo.retryDelay) {
+      const seconds = parseFloat(String(retryInfo.retryDelay).replace('s', ''));
+      if (!isNaN(seconds)) return Math.ceil(seconds);
+    }
+  } catch (e) {}
+  return null;
+}
+
 // --- very simple in-memory quota store -------------------------------
 // NOTE: resets on server restart / redeploy, and doesn't sync across
 // devices. The client also tracks its own quota in localStorage.
@@ -132,7 +148,7 @@ app.post('/api/chat', async (req, res) => {
     const baseBody = {
       contents,
       systemInstruction: {
-        parts: [{ text: 'You are Luminous AI, a premium, warm, precise assistant. Be clear, concise, and helpful. Format code in fenced code blocks with a language tag. Use $...$ for inline math and $$...$$ for block math — never write raw LaTeX outside these delimiters. When helping plan a trip, ask only for missing essentials (destination, dates, budget, interests) and then give a concrete day-by-day structure.' + CODING_INSTRUCTION + ' ' + styleInstruction + studentInstruction }]
+        parts: [{ text: 'You are Luminous AI, a premium, warm, precise assistant. Be clear, concise, and helpful. Have genuine personality — curious, encouraging, and direct rather than generic or robotic. Format code in fenced code blocks with a language tag. Use $...$ for inline math and $$...$$ for block math — never write raw LaTeX outside these delimiters. When helping plan a trip, ask only for missing essentials (destination, dates, budget, interests) and then give a concrete day-by-day structure. When a request is ambiguous, make a reasonable assumption and say so briefly rather than stalling with clarifying questions.' + CODING_INSTRUCTION + ' ' + styleInstruction + studentInstruction }]
       },
       generationConfig: { maxOutputTokens: 8192, temperature: 0.7 }
     };
@@ -166,19 +182,30 @@ app.post('/api/chat', async (req, res) => {
         upstream = await openStream(false);
       } else {
         console.error('Gemini stream failed with a quota/auth error — not retrying:', errBody);
-        let detail;
-        try { detail = JSON.parse(errBody).error?.message; } catch (e) { detail = errBody; }
-        return res.status(429).json({ error: 'Gemini quota exceeded', detail: friendlyQuotaMessage(detail) });
+        const retryAfterSeconds = extractRetryDelaySeconds(errBody);
+        return res.status(429).json({
+          error: 'Gemini quota exceeded',
+          detail: retryAfterSeconds ? `Rate-limited by Google — back in about ${retryAfterSeconds}s.` : friendlyQuotaMessage(null),
+          retryAfterSeconds
+        });
       }
     }
 
     if (!upstream.ok) {
       const errBody = await upstream.text().catch(() => '');
       console.error('Gemini stream error:', errBody);
+      const isQuota = /RESOURCE_EXHAUSTED|exceeded your current quota/i.test(errBody);
+      if (isQuota) {
+        const retryAfterSeconds = extractRetryDelaySeconds(errBody);
+        return res.status(429).json({
+          error: 'Gemini quota exceeded',
+          detail: retryAfterSeconds ? `Rate-limited by Google — back in about ${retryAfterSeconds}s.` : friendlyQuotaMessage(null),
+          retryAfterSeconds
+        });
+      }
       let detail;
       try { detail = JSON.parse(errBody).error?.message; } catch (e) { detail = errBody; }
-      const isQuota = /RESOURCE_EXHAUSTED|exceeded your current quota/i.test(errBody);
-      return res.status(isQuota ? 429 : 502).json({ error: 'Gemini request failed', detail: isQuota ? friendlyQuotaMessage(detail) : detail });
+      return res.status(502).json({ error: 'Gemini request failed', detail });
     }
 
     // From here on we're committed to an SSE response — stream text deltas as they arrive.
@@ -299,16 +326,32 @@ app.post('/api/summarize', async (req, res) => {
 });
 
 /**
+ * Free, no-key fallback image generator (Pollinations.ai). Used automatically
+ * whenever Gemini's image model fails — which, on a free-tier key with no
+ * billing enabled, is effectively always. This is what actually makes image
+ * generation and anime avatars work out of the box with zero configuration.
+ */
+async function generateWithPollinations(prompt) {
+  const seed = Math.floor(Math.random() * 1e9);
+  const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=768&height=768&nologo=true&seed=${seed}`;
+  const r = await fetch(url);
+  if (!r.ok) throw new Error('Pollinations request failed: ' + r.status);
+  const buf = await r.arrayBuffer();
+  const base64 = Buffer.from(buf).toString('base64');
+  const contentType = r.headers.get('content-type') || 'image/jpeg';
+  return `data:${contentType};base64,${base64}`;
+}
+
+/**
  * Image generation endpoint — used for the general "generate an image" feature
  * and for the anime-avatar unlocks in the XP/challenges system.
- * Uses Gemini's native image-output model ("Nano Banana"). Costs 1 request
- * from the same daily quota as chat, to keep the quota logic in one place.
+ * Tries Gemini's native image model first (better quality when billing is
+ * enabled on the key), and falls back automatically to a free no-key provider
+ * if Gemini fails for any reason (quota, billing, transient error). Costs 1
+ * request from the same daily quota as chat either way.
  */
 app.post('/api/generate-image', async (req, res) => {
   try {
-    if (!GEMINI_API_KEY) {
-      return res.status(500).json({ error: 'Server missing GEMINI_API_KEY' });
-    }
     const { prompt, userId } = req.body || {};
     if (!prompt) return res.status(400).json({ error: 'Missing prompt' });
 
@@ -316,37 +359,42 @@ app.post('/api/generate-image', async (req, res) => {
       return res.status(429).json({ error: 'Daily limit reached', reply: "You've used all your requests for today — watch an ad in the app to unlock 10 more." });
     }
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_IMAGE_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
-    const r = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        generationConfig: { responseModalities: ['TEXT', 'IMAGE'] }
-      })
-    });
-    const data = await r.json();
-    if (!r.ok) {
-      console.error('Image gen error:', JSON.stringify(data));
-      const status = data.error && data.error.status;
-      const msg = (data.error && data.error.message) || '';
-      const isQuota = status === 'RESOURCE_EXHAUSTED' || /quota|exceeded/i.test(msg);
-      if (isQuota) {
-        return res.status(429).json({
-          error: 'Image generation quota exceeded',
-          detail: "Google's image-generation model gives 0 free requests per day on API keys without billing enabled — this isn't a bug in the app. Enable billing on the Google Cloud project tied to your Gemini API key (Google AI Studio → your project → Billing) to unlock image generation. Text chat is unaffected and keeps working on the free tier."
+    if (GEMINI_API_KEY) {
+      try {
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_IMAGE_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+        const r = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ role: 'user', parts: [{ text: prompt }] }],
+            generationConfig: { responseModalities: ['TEXT', 'IMAGE'] }
+          })
         });
+        const data = await r.json();
+        if (r.ok) {
+          const parts = (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [];
+          const imgPart = parts.find(p => p.inlineData || p.inline_data);
+          const inline = imgPart && (imgPart.inlineData || imgPart.inline_data);
+          if (inline) {
+            const mime = inline.mimeType || inline.mime_type || 'image/png';
+            return res.json({ image: `data:${mime};base64,${inline.data}`, provider: 'gemini' });
+          }
+        } else {
+          console.error('Gemini image gen failed, falling back to Pollinations:', JSON.stringify(data));
+        }
+      } catch (e) {
+        console.error('Gemini image gen threw, falling back to Pollinations:', e.message);
       }
-      return res.status(502).json({ error: 'Image generation failed', detail: msg || 'Unknown error from Gemini.' });
     }
-    const parts = (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [];
-    const imgPart = parts.find(p => p.inlineData || p.inline_data);
-    const inline = imgPart && (imgPart.inlineData || imgPart.inline_data);
-    if (!inline) {
-      return res.status(502).json({ error: 'No image returned', detail: 'Model responded without image data — try a different prompt.' });
+
+    // Fallback path — free, no key, works without billing.
+    try {
+      const image = await generateWithPollinations(prompt);
+      return res.json({ image, provider: 'pollinations' });
+    } catch (e) {
+      console.error('Pollinations fallback also failed:', e.message);
+      return res.status(502).json({ error: 'Image generation failed', detail: 'Both the primary and fallback image providers failed. Try again in a moment.' });
     }
-    const mime = inline.mimeType || inline.mime_type || 'image/png';
-    res.json({ image: `data:${mime};base64,${inline.data}` });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Internal server error' });
