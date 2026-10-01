@@ -31,6 +31,7 @@ app.use(cors({ origin: process.env.ALLOWED_ORIGIN || '*' }));
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || 'PASTE_YOUR_GEMINI_API_KEY_HERE';
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
 const GEMINI_IMAGE_MODEL = process.env.GEMINI_IMAGE_MODEL || 'gemini-3.1-flash-image';
+const GEMINI_VIDEO_MODEL = process.env.GEMINI_VIDEO_MODEL || 'veo-3.1-generate-preview';
 const DAILY_LIMIT = parseInt(process.env.DAILY_LIMIT || '500', 10);
 
 function friendlyQuotaMessage(rawDetail) {
@@ -352,8 +353,9 @@ async function generateWithPollinations(prompt) {
  */
 app.post('/api/generate-image', async (req, res) => {
   try {
-    const { prompt, userId } = req.body || {};
+    const { prompt, image, userId } = req.body || {};
     if (!prompt) return res.status(400).json({ error: 'Missing prompt' });
+    const isEdit = !!image;
 
     if (!checkAndConsumeQuota(userId)) {
       return res.status(429).json({ error: 'Daily limit reached', reply: "You've used all your requests for today — watch an ad in the app to unlock 10 more." });
@@ -361,40 +363,140 @@ app.post('/api/generate-image', async (req, res) => {
 
     if (GEMINI_API_KEY) {
       try {
+        const parts = [{ text: prompt }];
+        if (isEdit) {
+          const match = /^data:(image\/[a-zA-Z]+);base64,(.+)$/.exec(image);
+          if (match) parts.unshift({ inline_data: { mime_type: match[1], data: match[2] } });
+        }
         const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_IMAGE_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
         const r = await fetch(url, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            contents: [{ role: 'user', parts: [{ text: prompt }] }],
+            contents: [{ role: 'user', parts }],
             generationConfig: { responseModalities: ['TEXT', 'IMAGE'] }
           })
         });
         const data = await r.json();
         if (r.ok) {
-          const parts = (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [];
-          const imgPart = parts.find(p => p.inlineData || p.inline_data);
+          const resParts = (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [];
+          const imgPart = resParts.find(p => p.inlineData || p.inline_data);
           const inline = imgPart && (imgPart.inlineData || imgPart.inline_data);
           if (inline) {
             const mime = inline.mimeType || inline.mime_type || 'image/png';
             return res.json({ image: `data:${mime};base64,${inline.data}`, provider: 'gemini' });
           }
         } else {
-          console.error('Gemini image gen failed, falling back to Pollinations:', JSON.stringify(data));
+          console.error('Gemini image gen/edit failed:', JSON.stringify(data));
+          if (isEdit) {
+            // Can't fall back to Pollinations for an edit — it would ignore the input photo entirely.
+            const msg = (data.error && data.error.message) || '';
+            const isQuota = /quota|exceeded|RESOURCE_EXHAUSTED/i.test(msg);
+            return res.status(isQuota ? 429 : 502).json({
+              error: 'AI edit failed',
+              detail: isQuota
+                ? "AI photo editing needs Gemini's image model, which requires billing enabled on your API key's Google Cloud project — there's no free fallback for editing an existing photo (only for generating a brand-new one). The manual sliders and filters still work for free."
+                : (msg || 'Unknown error from the image model.')
+            });
+          }
         }
       } catch (e) {
-        console.error('Gemini image gen threw, falling back to Pollinations:', e.message);
+        console.error('Gemini image gen threw:', e.message);
+        if (isEdit) {
+          return res.status(502).json({ error: 'AI edit failed', detail: 'Connection error reaching the image model.' });
+        }
       }
+    } else if (isEdit) {
+      return res.status(500).json({ error: 'Server missing GEMINI_API_KEY', detail: 'AI photo editing needs a configured Gemini API key.' });
     }
 
-    // Fallback path — free, no key, works without billing.
+    // Fallback path for plain text-to-image generation only — free, no key, works without billing.
     try {
-      const image = await generateWithPollinations(prompt);
-      return res.json({ image, provider: 'pollinations' });
+      const generated = await generateWithPollinations(prompt);
+      return res.json({ image: generated, provider: 'pollinations' });
     } catch (e) {
       console.error('Pollinations fallback also failed:', e.message);
       return res.status(502).json({ error: 'Image generation failed', detail: 'Both the primary and fallback image providers failed. Try again in a moment.' });
     }
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * Video generation (Veo) — starts a long-running generation job and returns
+ * its operation name for polling. IMPORTANT: unlike images, there is no free
+ * fallback for video — Veo has no free tier at all and costs real money per
+ * second of output, so this only works once billing is enabled on the key.
+ */
+app.post('/api/generate-video', async (req, res) => {
+  try {
+    if (!GEMINI_API_KEY) return res.status(500).json({ error: 'Server missing GEMINI_API_KEY' });
+    const { prompt, userId } = req.body || {};
+    if (!prompt) return res.status(400).json({ error: 'Missing prompt' });
+    if (!checkAndConsumeQuota(userId)) {
+      return res.status(429).json({ error: 'Daily limit reached' });
+    }
+
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_VIDEO_MODEL}:predictLongRunning?key=${GEMINI_API_KEY}`;
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ instances: [{ prompt }] })
+    });
+    const data = await r.json();
+    if (!r.ok) {
+      console.error('Video gen start failed:', JSON.stringify(data));
+      const msg = (data.error && data.error.message) || '';
+      const isQuota = /quota|exceeded|RESOURCE_EXHAUSTED|billing/i.test(msg);
+      return res.status(isQuota ? 429 : 502).json({
+        error: 'Video generation failed',
+        detail: isQuota
+          ? "Video generation (Veo) has no free tier at all — it only works with billing enabled on this API key's Google Cloud project, and costs roughly $0.15-$0.40 per second of video generated. Enable billing in Google AI Studio if you want to use this feature."
+          : (msg || 'Unknown error starting video generation.')
+      });
+    }
+    res.json({ operationName: data.name });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/** Poll a video generation operation until it's done. */
+app.get('/api/video-status', async (req, res) => {
+  try {
+    if (!GEMINI_API_KEY) return res.status(500).json({ error: 'Server missing GEMINI_API_KEY' });
+    const operation = req.query.operation;
+    if (!operation) return res.status(400).json({ error: 'Missing operation' });
+
+    const url = `https://generativelanguage.googleapis.com/v1beta/${operation}?key=${GEMINI_API_KEY}`;
+    const r = await fetch(url);
+    const data = await r.json();
+    if (!r.ok) return res.status(502).json({ error: 'Status check failed', detail: data.error && data.error.message });
+    if (!data.done) return res.json({ done: false });
+
+    const sample = data.response
+      && data.response.generateVideoResponse
+      && data.response.generateVideoResponse.generatedSamples
+      && data.response.generateVideoResponse.generatedSamples[0];
+    const video = sample && sample.video;
+    if (!video) {
+      return res.json({ done: true, error: 'The model finished but returned no video — try a different prompt.' });
+    }
+    if (video.bytesBase64Encoded) {
+      return res.json({ done: true, video: `data:video/mp4;base64,${video.bytesBase64Encoded}` });
+    }
+    if (video.uri) {
+      const sep = video.uri.includes('?') ? '&' : '?';
+      const fileRes = await fetch(`${video.uri}${sep}key=${GEMINI_API_KEY}`);
+      if (!fileRes.ok) return res.status(502).json({ error: 'Could not download the generated video file' });
+      const buf = await fileRes.arrayBuffer();
+      const base64 = Buffer.from(buf).toString('base64');
+      return res.json({ done: true, video: `data:video/mp4;base64,${base64}` });
+    }
+    res.json({ done: true, error: 'Unrecognized video response from the model.' });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Internal server error' });
