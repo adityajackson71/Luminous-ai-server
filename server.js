@@ -332,10 +332,19 @@ app.post('/api/summarize', async (req, res) => {
  * billing enabled, is effectively always. This is what actually makes image
  * generation and anime avatars work out of the box with zero configuration.
  */
+// Pollinations' watermark removal (`nologo`) requires a free registered token as of
+// 2026 — anonymous requests get a small "pollinations.ai" mark regardless of the
+// nologo param. Get a free token at https://auth.pollinations.ai and set it as
+// POLLINATIONS_TOKEN on Render to remove it. Without a token, images still generate
+// fine, just with the mark.
+const POLLINATIONS_TOKEN = process.env.POLLINATIONS_TOKEN || '';
+
 async function generateWithPollinations(prompt) {
   const seed = Math.floor(Math.random() * 1e9);
   const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=768&height=768&nologo=true&seed=${seed}`;
-  const r = await fetch(url);
+  const headers = {};
+  if (POLLINATIONS_TOKEN) headers['Authorization'] = `Bearer ${POLLINATIONS_TOKEN}`;
+  const r = await fetch(url, { headers });
   if (!r.ok) throw new Error('Pollinations request failed: ' + r.status);
   const buf = await r.arrayBuffer();
   const base64 = Buffer.from(buf).toString('base64');
