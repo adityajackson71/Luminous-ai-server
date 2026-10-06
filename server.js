@@ -433,40 +433,91 @@ app.post('/api/generate-image', async (req, res) => {
   }
 });
 
+// Free fallback for video — Hugging Face's shared inference tier running an
+// open-source text-to-video model. Lower quality than Veo (older, lighter
+// model, shared free GPUs, often slow or briefly unavailable), but genuinely
+// free to start. Needs a free token from https://huggingface.co/settings/tokens
+// set as HUGGINGFACE_TOKEN. Without a token, this fallback is skipped.
+const HUGGINGFACE_TOKEN = process.env.HUGGINGFACE_TOKEN || '';
+const HF_VIDEO_MODEL = process.env.HF_VIDEO_MODEL || 'damo-vilab/text-to-video-ms-1.7b';
+
+async function generateVideoWithHuggingFace(prompt) {
+  const url = `https://api-inference.huggingface.co/models/${HF_VIDEO_MODEL}`;
+  // The free shared model can be "cold" and need a few seconds to load — retry briefly.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${HUGGINGFACE_TOKEN}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ inputs: prompt })
+    });
+    if (r.status === 503) {
+      const info = await r.json().catch(() => ({}));
+      await new Promise(res => setTimeout(res, Math.min(15000, (info.estimated_time || 8) * 1000)));
+      continue;
+    }
+    if (!r.ok) {
+      const errText = await r.text().catch(() => '');
+      throw new Error(`Hugging Face video request failed (${r.status}): ${errText.slice(0, 200)}`);
+    }
+    const buf = await r.arrayBuffer();
+    const base64 = Buffer.from(buf).toString('base64');
+    const contentType = r.headers.get('content-type') || 'video/mp4';
+    return `data:${contentType};base64,${base64}`;
+  }
+  throw new Error('Hugging Face video model stayed unavailable after retries.');
+}
+
 /**
- * Video generation (Veo) — starts a long-running generation job and returns
- * its operation name for polling. IMPORTANT: unlike images, there is no free
- * fallback for video — Veo has no free tier at all and costs real money per
- * second of output, so this only works once billing is enabled on the key.
+ * Video generation. Tries Veo first (best quality, needs billing — Google
+ * gives it no free tier at all). If that fails, falls back to a free
+ * Hugging Face open-source model when HUGGINGFACE_TOKEN is configured.
  */
 app.post('/api/generate-video', async (req, res) => {
   try {
-    if (!GEMINI_API_KEY) return res.status(500).json({ error: 'Server missing GEMINI_API_KEY' });
     const { prompt, userId } = req.body || {};
     if (!prompt) return res.status(400).json({ error: 'Missing prompt' });
     if (!checkAndConsumeQuota(userId)) {
       return res.status(429).json({ error: 'Daily limit reached' });
     }
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_VIDEO_MODEL}:predictLongRunning?key=${GEMINI_API_KEY}`;
-    const r = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ instances: [{ prompt }] })
-    });
-    const data = await r.json();
-    if (!r.ok) {
-      console.error('Video gen start failed:', JSON.stringify(data));
-      const msg = (data.error && data.error.message) || '';
-      const isQuota = /quota|exceeded|RESOURCE_EXHAUSTED|billing/i.test(msg);
-      return res.status(isQuota ? 429 : 502).json({
-        error: 'Video generation failed',
-        detail: isQuota
-          ? "Video generation (Veo) has no free tier at all — it only works with billing enabled on this API key's Google Cloud project, and costs roughly $0.15-$0.40 per second of video generated. Enable billing in Google AI Studio if you want to use this feature."
-          : (msg || 'Unknown error starting video generation.')
-      });
+    if (GEMINI_API_KEY) {
+      try {
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_VIDEO_MODEL}:predictLongRunning?key=${GEMINI_API_KEY}`;
+        const r = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ instances: [{ prompt }] })
+        });
+        const data = await r.json();
+        if (r.ok) {
+          return res.json({ operationName: data.name, provider: 'veo' });
+        }
+        console.error('Veo start failed, trying free fallback if configured:', JSON.stringify(data));
+      } catch (e) {
+        console.error('Veo threw, trying free fallback if configured:', e.message);
+      }
     }
-    res.json({ operationName: data.name });
+
+    if (HUGGINGFACE_TOKEN) {
+      try {
+        const video = await generateVideoWithHuggingFace(prompt);
+        return res.json({ video, provider: 'huggingface' });
+      } catch (e) {
+        console.error('Hugging Face video fallback failed:', e.message);
+        return res.status(502).json({
+          error: 'Video generation failed',
+          detail: "The free Hugging Face video model is temporarily unavailable or overloaded (it runs on shared free GPUs, so this happens sometimes). Try again in a minute, or enable billing on your Gemini key for reliable Veo video generation."
+        });
+      }
+    }
+
+    return res.status(429).json({
+      error: 'Video generation unavailable',
+      detail: "Veo (Google's video model) needs billing enabled — it has no free tier at all. For a free alternative, set a HUGGINGFACE_TOKEN (free, from huggingface.co/settings/tokens) in your Render environment variables; quality is lower than Veo since it uses an older open-source model on shared free GPUs, but it costs nothing."
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Internal server error' });
