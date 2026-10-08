@@ -433,17 +433,22 @@ app.post('/api/generate-image', async (req, res) => {
   }
 });
 
-// Free fallback for video — Hugging Face's shared inference tier running an
-// open-source text-to-video model. Lower quality than Veo (older, lighter
-// model, shared free GPUs, often slow or briefly unavailable), but genuinely
-// free to start. Needs a free token from https://huggingface.co/settings/tokens
-// set as HUGGINGFACE_TOKEN. Without a token, this fallback is skipped.
+// HONEST NOTE ON FREE VIDEO: there is currently no verified, genuinely free,
+// zero-setup hosted API for AI video generation. The obvious open-source
+// candidate (damo-vilab/text-to-video-ms-1.7b) is NOT deployed by any
+// Hugging Face Inference Provider — HF's own docs say so explicitly — so it
+// cannot be called as a hosted API at all, only run on your own GPU via code.
+// Pollinations' video endpoint runs on paid "Pollen credits," not a free tier.
+// HUGGINGFACE_TOKEN is still read here in case you find and configure a model
+// that IS actually deployed on an Inference Provider later (check a model's
+// page for "Inference Providers" support before trusting it) — but there is
+// no working default right now, so this fallback is off unless you set
+// HF_VIDEO_MODEL yourself to something confirmed working.
 const HUGGINGFACE_TOKEN = process.env.HUGGINGFACE_TOKEN || '';
-const HF_VIDEO_MODEL = process.env.HF_VIDEO_MODEL || 'damo-vilab/text-to-video-ms-1.7b';
+const HF_VIDEO_MODEL = process.env.HF_VIDEO_MODEL || '';
 
 async function generateVideoWithHuggingFace(prompt) {
   const url = `https://api-inference.huggingface.co/models/${HF_VIDEO_MODEL}`;
-  // The free shared model can be "cold" and need a few seconds to load — retry briefly.
   for (let attempt = 0; attempt < 3; attempt++) {
     const r = await fetch(url, {
       method: 'POST',
@@ -460,20 +465,22 @@ async function generateVideoWithHuggingFace(prompt) {
     }
     if (!r.ok) {
       const errText = await r.text().catch(() => '');
-      throw new Error(`Hugging Face video request failed (${r.status}): ${errText.slice(0, 200)}`);
+      throw new Error(`HF request failed (${r.status}): ${errText.slice(0, 300)}`);
     }
     const buf = await r.arrayBuffer();
     const base64 = Buffer.from(buf).toString('base64');
     const contentType = r.headers.get('content-type') || 'video/mp4';
     return `data:${contentType};base64,${base64}`;
   }
-  throw new Error('Hugging Face video model stayed unavailable after retries.');
+  throw new Error('Model stayed unavailable after retries.');
 }
 
 /**
- * Video generation. Tries Veo first (best quality, needs billing — Google
- * gives it no free tier at all). If that fails, falls back to a free
- * Hugging Face open-source model when HUGGINGFACE_TOKEN is configured.
+ * Video generation. Tries Veo first (real quality, needs billing — Google
+ * gives it no free tier). Only attempts the Hugging Face path if you've
+ * explicitly set HF_VIDEO_MODEL to a model you've confirmed is actually
+ * deployed on an Inference Provider — there's no safe default, since the
+ * obvious free candidate turned out not to be callable at all.
  */
 app.post('/api/generate-video', async (req, res) => {
   try {
@@ -495,28 +502,25 @@ app.post('/api/generate-video', async (req, res) => {
         if (r.ok) {
           return res.json({ operationName: data.name, provider: 'veo' });
         }
-        console.error('Veo start failed, trying free fallback if configured:', JSON.stringify(data));
+        console.error('Veo start failed:', JSON.stringify(data));
       } catch (e) {
-        console.error('Veo threw, trying free fallback if configured:', e.message);
+        console.error('Veo threw:', e.message);
       }
     }
 
-    if (HUGGINGFACE_TOKEN) {
+    if (HUGGINGFACE_TOKEN && HF_VIDEO_MODEL) {
       try {
         const video = await generateVideoWithHuggingFace(prompt);
         return res.json({ video, provider: 'huggingface' });
       } catch (e) {
         console.error('Hugging Face video fallback failed:', e.message);
-        return res.status(502).json({
-          error: 'Video generation failed',
-          detail: "The free Hugging Face video model is temporarily unavailable or overloaded (it runs on shared free GPUs, so this happens sometimes). Try again in a minute, or enable billing on your Gemini key for reliable Veo video generation."
-        });
+        return res.status(502).json({ error: 'Video generation failed', detail: `Free fallback failed: ${e.message}` });
       }
     }
 
     return res.status(429).json({
       error: 'Video generation unavailable',
-      detail: "Veo (Google's video model) needs billing enabled — it has no free tier at all. For a free alternative, set a HUGGINGFACE_TOKEN (free, from huggingface.co/settings/tokens) in your Render environment variables; quality is lower than Veo since it uses an older open-source model on shared free GPUs, but it costs nothing."
+      detail: "Veo (Google's video model) needs billing enabled on your API key — there's genuinely no free tier for it. I checked for a free alternative and couldn't find one that's actually callable as a hosted API right now (the obvious open-source option isn't deployed on any provider). Enabling billing on GEMINI_API_KEY is currently the only working path to AI video here."
     });
   } catch (err) {
     console.error(err);
