@@ -432,5 +432,69 @@ app.post('/api/generate-image', async (req, res) => {
   }
 });
 
+/**
+ * GitHub OAuth — a free sign-in alternative that never asks for a payment
+ * method, unlike Google Cloud Console's identity verification. GitHub's
+ * OAuth flow needs a client secret to exchange the login code for a token,
+ * and that secret must never reach the browser — this is why it needs a
+ * backend endpoint, unlike Google's pure-client-side token flow.
+ *
+ * Required env vars: GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET
+ * (from https://github.com/settings/developers — free, no billing ever)
+ */
+const GITHUB_CLIENT_ID = process.env.GITHUB_CLIENT_ID || '';
+const GITHUB_CLIENT_SECRET = process.env.GITHUB_CLIENT_SECRET || '';
+
+app.post('/api/github-oauth', async (req, res) => {
+  try {
+    if (!GITHUB_CLIENT_ID || !GITHUB_CLIENT_SECRET) {
+      return res.status(500).json({ error: 'Server missing GITHUB_CLIENT_ID/GITHUB_CLIENT_SECRET' });
+    }
+    const { code, redirectUri } = req.body || {};
+    if (!code) return res.status(400).json({ error: 'Missing code' });
+
+    const tokenRes = await fetch('https://github.com/login/oauth/access_token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify({
+        client_id: GITHUB_CLIENT_ID,
+        client_secret: GITHUB_CLIENT_SECRET,
+        code,
+        redirect_uri: redirectUri
+      })
+    });
+    const tokenData = await tokenRes.json();
+    if (!tokenData.access_token) {
+      console.error('GitHub token exchange failed:', JSON.stringify(tokenData));
+      return res.status(502).json({ error: 'GitHub sign-in failed', detail: tokenData.error_description || 'Could not get an access token.' });
+    }
+
+    const headers = {
+      'Authorization': `Bearer ${tokenData.access_token}`,
+      'Accept': 'application/vnd.github+json',
+      'User-Agent': 'Luminous-AI'
+    };
+    const userRes = await fetch('https://api.github.com/user', { headers });
+    const user = await userRes.json();
+
+    // GitHub only includes email in /user if it's public; otherwise fetch the verified primary one.
+    let email = user.email;
+    if (!email) {
+      const emailsRes = await fetch('https://api.github.com/user/emails', { headers });
+      const emails = await emailsRes.json();
+      const primary = Array.isArray(emails) && emails.find(e => e.primary && e.verified);
+      email = primary ? primary.email : (Array.isArray(emails) && emails[0] ? emails[0].email : null);
+    }
+    if (!email) {
+      return res.status(502).json({ error: 'GitHub sign-in failed', detail: 'Your GitHub account has no accessible email — make one public or verified and try again.' });
+    }
+
+    res.json({ name: user.name || user.login, email: email.toLowerCase() });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Luminous AI backend running on port ${PORT} (model: ${GEMINI_MODEL})`));
