@@ -336,7 +336,7 @@ app.post('/api/summarize', async (req, res) => {
 // nologo param. Get a free token at https://auth.pollinations.ai and set it as
 // POLLINATIONS_TOKEN on Render to remove it. Without a token, images still generate
 // fine, just with the mark.
-const POLLINATIONS_TOKEN = process.env.POLLINATIONS_TOKEN || 'sk_8vIbuPA6F7WaOuuhTDp1SCblfB3MpFVz';
+const POLLINATIONS_TOKEN = process.env.POLLINATIONS_TOKEN || '';
 
 async function generateWithPollinations(prompt) {
   const seed = Math.floor(Math.random() * 1e9);
@@ -442,13 +442,16 @@ app.post('/api/generate-image', async (req, res) => {
  * Required env vars: GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET
  * (from https://github.com/settings/developers — free, no billing ever)
  */
-const GITHUB_CLIENT_ID = process.env.GITHUB_CLIENT_ID || 'Ov23liXcFrrmpxFk7NHx';
+const GITHUB_CLIENT_ID = process.env.GITHUB_CLIENT_ID || '';
 const GITHUB_CLIENT_SECRET = process.env.GITHUB_CLIENT_SECRET || '';
 
 app.post('/api/github-oauth', async (req, res) => {
   try {
     if (!GITHUB_CLIENT_ID || !GITHUB_CLIENT_SECRET) {
-      return res.status(500).json({ error: 'Server missing GITHUB_CLIENT_ID/GITHUB_CLIENT_SECRET' });
+      return res.status(500).json({
+        error: 'Server missing GITHUB_CLIENT_ID/GITHUB_CLIENT_SECRET',
+        detail: 'The backend on Render is missing GITHUB_CLIENT_ID and/or GITHUB_CLIENT_SECRET as environment variables — add both under the Environment tab and redeploy.'
+      });
     }
     const { code, redirectUri } = req.body || {};
     if (!code) return res.status(400).json({ error: 'Missing code' });
@@ -491,8 +494,8 @@ app.post('/api/github-oauth', async (req, res) => {
 
     res.json({ name: user.name || user.login, email: email.toLowerCase() });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('GitHub OAuth endpoint error:', err);
+    res.status(500).json({ error: 'Internal server error', detail: err.message });
   }
 });
 
