@@ -76,6 +76,83 @@ function checkAndConsumeQuota(userId) {
   return true;
 }
 
+// --- activity tracking (for your team's dashboard, NOT message content) ----
+// Logs what happened (event type, feature used, error type) and when,
+// never what was said. Capped ring buffer in memory — resets on restart/
+// redeploy, same limitation as the quota store above. Good enough to spot
+// patterns and bugs; swap for a real database if you want history to persist
+// long-term.
+const ACTIVITY_LOG_CAP = 5000;
+const activityLog = [];
+const ADMIN_KEY = process.env.ADMIN_KEY || '';
+
+function logActivity(event, userId, meta) {
+  activityLog.push({
+    t: Date.now(),
+    event,
+    userId: userId || 'anonymous',
+    meta: meta || null
+  });
+  if (activityLog.length > ACTIVITY_LOG_CAP) activityLog.shift();
+}
+
+app.post('/api/track', (req, res) => {
+  try {
+    const { event, userId, meta } = req.body || {};
+    if (!event || typeof event !== 'string' || event.length > 60) {
+      return res.status(400).json({ error: 'Invalid event' });
+    }
+    // meta is for short structured context only (an error code, a feature name) —
+    // never pass message text into this; keep payloads small and non-sensitive.
+    const safeMeta = meta && typeof meta === 'object'
+      ? Object.fromEntries(Object.entries(meta).slice(0, 8).map(([k, v]) => [String(k).slice(0, 40), String(v).slice(0, 200)]))
+      : null;
+    logActivity(event, userId, safeMeta);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+function requireAdmin(req, res, next) {
+  if (!ADMIN_KEY) return res.status(500).json({ error: 'Server missing ADMIN_KEY' });
+  const key = req.query.key || req.headers['x-admin-key'];
+  if (key !== ADMIN_KEY) return res.status(401).json({ error: 'Invalid admin key' });
+  next();
+}
+
+app.get('/api/admin/stats', requireAdmin, (req, res) => {
+  const since = Date.now() - 7 * 24 * 60 * 60 * 1000; // last 7 days
+  const recent = activityLog.filter(e => e.t >= since);
+
+  const byEvent = {};
+  const byUser = {};
+  const byDay = {};
+  const errors = [];
+
+  recent.forEach(e => {
+    byEvent[e.event] = (byEvent[e.event] || 0) + 1;
+    byUser[e.userId] = (byUser[e.userId] || 0) + 1;
+    const day = new Date(e.t).toISOString().slice(0, 10);
+    byDay[day] = (byDay[day] || 0) + 1;
+    if (e.event.includes('error') || e.event.includes('failed')) {
+      errors.push(e);
+    }
+  });
+
+  res.json({
+    totalEvents: recent.length,
+    uniqueUsers: Object.keys(byUser).length,
+    byEvent,
+    byDay,
+    topUsers: Object.entries(byUser).sort((a, b) => b[1] - a[1]).slice(0, 20),
+    recentErrors: errors.slice(-100).reverse(),
+    recentEvents: recent.slice(-200).reverse(),
+    logCapacity: ACTIVITY_LOG_CAP,
+    logCurrentSize: activityLog.length
+  });
+});
+
 app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'Luminous AI backend', model: GEMINI_MODEL });
 });
