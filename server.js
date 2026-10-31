@@ -153,6 +153,45 @@ app.get('/api/admin/stats', requireAdmin, (req, res) => {
   });
 });
 
+// --- data deletion (backs the public /deletedata page used for Google Play) --
+// Removes every activity record tied to an email. The daily-limit counter is
+// deliberately NOT deleted instantly for today's date — if it were, anyone could
+// "delete their data" to reset their daily quota. It's purged automatically once
+// its day has passed (hourly sweep below), so it never lives longer than ~24h.
+app.post('/api/delete-data', (req, res) => {
+  try {
+    const email = String((req.body && req.body.email) || '').trim().toLowerCase();
+    if (!email || email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ error: 'A valid email is required' });
+    }
+    let removedEvents = 0;
+    for (let i = activityLog.length - 1; i >= 0; i--) {
+      if (String(activityLog[i].userId).toLowerCase() === email) {
+        activityLog.splice(i, 1);
+        removedEvents++;
+      }
+    }
+    const entry = quotaStore.get(email);
+    let quotaRemoved = false;
+    if (entry && entry.date !== todayKey()) {
+      quotaStore.delete(email);
+      quotaRemoved = true;
+    }
+    res.json({ ok: true, removedEvents, quotaPendingPurge: !!entry && !quotaRemoved });
+  } catch (err) {
+    console.error('delete-data error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Hourly sweep: drop daily-limit counters from previous days (they reset anyway).
+setInterval(() => {
+  const today = todayKey();
+  for (const [key, entry] of quotaStore) {
+    if (entry.date !== today) quotaStore.delete(key);
+  }
+}, 60 * 60 * 1000).unref();
+
 app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'Luminous AI backend', model: GEMINI_MODEL });
 });
